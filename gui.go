@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"sqlsync/internal/backup"
@@ -18,6 +20,9 @@ import (
 	"sqlsync/internal/progress"
 	"sqlsync/internal/restore"
 )
+
+//go:embed assets/icon.png
+var iconBytes []byte
 
 // guiApp 集中管理 GUI 状态。
 type guiApp struct {
@@ -59,6 +64,10 @@ const maxVisibleRows = 40 // 界面上最多保留的任务行数，超出则移
 
 func runGUI() {
 	a := app.NewWithID("com.sqlsync.gui")
+	a.Settings().SetTheme(newTheme())
+	if len(iconBytes) > 0 {
+		a.SetIcon(fyne.NewStaticResource("icon.png", iconBytes))
+	}
 	g := &guiApp{app: a, taskRows: map[string]*taskRow{}}
 	g.win = a.NewWindow("SQLSync —— MySQL 备份 / 恢复")
 	content := g.buildUI()
@@ -88,22 +97,23 @@ func (g *guiApp) buildUI() fyne.CanvasObject {
 	bottom := container.NewVBox(
 		widget.NewSeparator(),
 		container.NewGridWithColumns(3,
-			container.NewVBox(widget.NewLabel("总体进度"), g.overallBar, g.overallLabel),
-			container.NewVBox(widget.NewLabel("正在执行的任务"), taskScroll),
-			container.NewVBox(widget.NewLabel("日志"), g.logArea),
+			widget.NewCard("总体进度", "", container.NewVBox(g.overallBar, g.overallLabel)),
+			widget.NewCard("正在执行的任务", "", taskScroll),
+			widget.NewCard("日志", "", g.logArea),
 		),
 		g.status,
 	)
 
 	g.tabs = container.NewAppTabs(
-		container.NewTabItem("备份", backupTab),
-		container.NewTabItem("恢复", restoreTab),
+		container.NewTabItemWithIcon("备份", theme.DocumentSaveIcon(), backupTab),
+		container.NewTabItemWithIcon("恢复", theme.ViewRestoreIcon(), restoreTab),
 	)
+	g.tabs.SetTabLocation(container.TabLocationTop)
 
 	return container.NewBorder(connPanel, bottom, nil, nil, g.tabs)
 }
 
-// buildConnPanel 顶部的连接配置区。
+// buildConnPanel 顶部的连接配置卡片。
 func (g *guiApp) buildConnPanel() fyne.CanvasObject {
 	g.host = widget.NewEntry()
 	g.host.SetPlaceHolder("主机，如 116.176.114.10")
@@ -127,18 +137,21 @@ func (g *guiApp) buildConnPanel() fyne.CanvasObject {
 			}
 		}, g.win)
 	})
+	caBtn.Importance = widget.LowImportance
 
 	testBtn := widget.NewButton("测试连接", func() { g.testConnection() })
+	testBtn.Importance = widget.SuccessImportance
 
-	row1 := container.NewGridWithColumns(4,
-		labelWith("主机", g.host), labelWith("端口", g.port),
-		labelWith("用户", g.user), labelWith("密码", g.pass))
-	row2 := container.NewGridWithColumns(4,
-		labelWith("SSL 模式", g.sslMode),
-		container.NewBorder(nil, nil, widget.NewLabel("CA 证书"), caBtn, g.sslCA),
-		widget.NewLabel(""), testBtn)
-
-	return container.NewVBox(widget.NewLabelWithStyle("数据库连接", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), row1, row2)
+	form := widget.NewForm(
+		widget.NewFormItem("主机", g.host),
+		widget.NewFormItem("端口", g.port),
+		widget.NewFormItem("用户", g.user),
+		widget.NewFormItem("密码", g.pass),
+		widget.NewFormItem("SSL 模式", g.sslMode),
+		widget.NewFormItem("CA 证书", container.NewBorder(nil, nil, nil, caBtn, g.sslCA)),
+		widget.NewFormItem("", container.NewHBox(testBtn)),
+	)
+	return widget.NewCard("数据库连接", "备份/恢复共用的服务器参数", form)
 }
 
 func labelWith(name string, obj fyne.CanvasObject) *fyne.Container {
@@ -211,19 +224,29 @@ func (g *guiApp) buildBackupTab() fyne.CanvasObject {
 			return err
 		})
 	})
+	startBtn.Importance = widget.HighImportance
 	cancelBtn := widget.NewButton("取消", func() { g.cancelTask() })
+	cancelBtn.Importance = widget.DangerImportance
+
+	paramForm := widget.NewForm(
+		widget.NewFormItem("输出目录", container.NewBorder(nil, nil, nil, dirBtn, outDir)),
+		widget.NewFormItem("表过滤", tables),
+		widget.NewFormItem("并行数", workers),
+		widget.NewFormItem("分片阈值(行)", shardMin),
+		widget.NewFormItem("最大分片", shardMax),
+		widget.NewFormItem("块行数", chunkRows),
+		widget.NewFormItem("每 INSERT 行数", rowsPerInsert),
+		widget.NewFormItem("压缩", gzipChk),
+	)
 
 	form := container.NewVBox(
-		labelWith("输出目录", container.NewBorder(nil, nil, nil, dirBtn, outDir)),
-		widget.NewLabelWithStyle("数据库选择（不勾任何项 = 全部非系统库）", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewHBox(loadBtn, allBtn, clearBtn),
-		dbScroll,
-		labelWith("表过滤", tables),
-		container.NewGridWithColumns(4,
-			labelWith("并行数", workers), labelWith("分片阈值(行)", shardMin),
-			labelWith("最大分片", shardMax), labelWith("块行数", chunkRows)),
-		container.NewGridWithColumns(2, labelWith("每 INSERT 行数", rowsPerInsert), gzipChk),
-		container.NewHBox(startBtn, cancelBtn),
+		widget.NewCard("备份参数", "", paramForm),
+		widget.NewCard("数据库选择", "不勾任何项 = 全部非系统库",
+			container.NewVBox(
+				container.NewHBox(loadBtn, allBtn, clearBtn),
+				dbScroll,
+				container.NewHBox(startBtn, cancelBtn),
+			)),
 	)
 	return container.NewVScroll(form)
 }
@@ -322,17 +345,26 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 		}
 		g.doRestore(dir, rename, workers, commitBatch, createChk.Checked, false, startBtn)
 	})
+	startBtn.Importance = widget.HighImportance
 	cancelBtn := widget.NewButton("取消", func() { g.cancelTask() })
+	cancelBtn.Importance = widget.DangerImportance
+
+	paramForm := widget.NewForm(
+		widget.NewFormItem("备份目录", container.NewBorder(nil, nil, nil, dirBtn, dir)),
+		widget.NewFormItem("改名映射", rename),
+		widget.NewFormItem("并行数", workers),
+		widget.NewFormItem("批量提交", commitBatch),
+		widget.NewFormItem("", container.NewHBox(createChk, recreateChk)),
+	)
 
 	form := container.NewVBox(
-		labelWith("备份目录", container.NewBorder(nil, nil, nil, dirBtn, dir)),
-		widget.NewLabelWithStyle("数据库选择（不勾任何项 = 目录内全部）", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewHBox(scanBtn, allBtn, clearBtn),
-		dbScroll,
-		labelWith("改名映射", rename),
-		container.NewGridWithColumns(2, labelWith("并行数", workers), labelWith("批量提交", commitBatch)),
-		container.NewHBox(createChk, recreateChk),
-		container.NewHBox(startBtn, cancelBtn),
+		widget.NewCard("恢复参数", "", paramForm),
+		widget.NewCard("数据库选择", "不勾任何项 = 目录内全部",
+			container.NewVBox(
+				container.NewHBox(scanBtn, allBtn, clearBtn),
+				dbScroll,
+				container.NewHBox(startBtn, cancelBtn),
+			)),
 	)
 	return container.NewVScroll(form)
 }

@@ -9,27 +9,42 @@ import (
 	"github.com/go-sql-driver/mysql"
 )
 
-// TestListDatabasesLive 真实连库验证 ListDatabases。
-// 默认跳过；设置环境变量后运行，例如：
-//
-//	SQLSYNC_LIVE_DSN='oms:oms@2026@tcp(127.0.0.1:6033)/' go test -run Live ./internal/dbconn
-//
-// 注意密码含 @ 时不会被正确解析，改用 SSL 参数省略的场景请直接改写 Config。
-func TestListDatabasesLive(t *testing.T) {
+// liveConn 从 DSN 解析出的连接要素。
+type liveConn struct {
+	host, user, pass string
+	port             int
+}
+
+// envLiveDSN 读取真实连库测试的 DSN，未设置时跳过。
+func envLiveDSN(t *testing.T) string {
 	dsn := os.Getenv("SQLSYNC_LIVE_DSN")
 	if dsn == "" {
 		t.Skip("未设置 SQLSYNC_LIVE_DSN，跳过真实连库测试")
 	}
+	return dsn
+}
+
+// parseLiveDSN 把 'user:pass@tcp(host:port)/' 形式的 DSN 解析为 liveConn。
+func parseLiveDSN(t *testing.T, dsn string) liveConn {
 	mc, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		t.Fatalf("DSN 解析失败: %v", err)
 	}
-	host, port := splitAddr(mc.Addr)
+	h, p := splitAddr(mc.Addr)
+	return liveConn{host: h, port: p, user: mc.User, pass: mc.Passwd}
+}
+
+// TestListDatabasesLive 真实连库验证 ListDatabases。
+// 默认跳过；设置环境变量后运行，例如：
+//
+//	SQLSYNC_LIVE_DSN='user:pass@tcp(127.0.0.1:6033)/' go test -run Live ./internal/dbconn
+func TestListDatabasesLive(t *testing.T) {
+	c := parseLiveDSN(t, envLiveDSN(t))
 	cfg := Config{
-		Host:     host,
-		Port:     port,
-		User:     mc.User,
-		Password: mc.Passwd,
+		Host:     c.host,
+		Port:     c.port,
+		User:     c.user,
+		Password: c.pass,
 		SSLMode:  "skip-verify",
 	}
 	dbs, err := ListDatabases(cfg)
