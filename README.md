@@ -44,12 +44,20 @@ backups/
 
 ## 使用
 
+### 发行包（dist/）
+
+| 文件 | 平台 | 说明 |
+| --- | --- | --- |
+| `sqlsync-darwin-arm64` | macOS Apple Silicon | 完整 GUI + CLI |
+| `sqlsync-windows-amd64.exe` | Windows x64 | 完整 GUI + CLI |
+| `sqlsync-linux-amd64` | Linux x64 | **CLI-only**（纯静态、零依赖，适合服务器/容器） |
+
+> Linux GUI 版需要在 Linux 环境编译（Fyne 依赖 X11 cgo），推荐用 [fyne-cross](https://fyne.io/fyne-cross/)（Docker）；本仓库默认发布的 Linux 包为 CLI-only。
+
 ### GUI（默认）
 
 ```bash
-go run .
-# 或编译后
-go build -o sqlsync . && ./sqlsync
+./sqlsync              # macOS / Windows 双击或终端启动
 ```
 
 界面包含：连接配置（支持测试连接）→「备份」「恢复」页签 → 实时进度与日志。
@@ -83,9 +91,27 @@ sqlsync restore -host ... -dir ./backups -recreate
 
 - `disable`：明文连接
 - `preferred`（默认）：优先 SSL，失败退回明文
-- `skip-verify`：加密但不校验证书
+- `skip-verify`：加密但不校验证书 —— **等价于 JDBC `useSSL=true`**（连接 Azure Database for MySQL 等云托管库用这个即可）
 - `verify-ca`：校验证书链（需提供 `-ssl-ca`），不校验主机名
 - `verify-full`：校验证书链 + 主机名
+
+云数据库（如 Azure 中国区 `*.mysql.database.chinacloudapi.cn`）强制 TLS，用 `skip-verify` 即可完成 TLSv1.3 加密协商（已实测 `TLS_AES_128_GCM_SHA256`）。
+
+## 从源码构建
+
+```bash
+# macOS（GUI + CLI）
+go build -o sqlsync .
+
+# Linux CLI-only（纯静态，无 X11 依赖）
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/sqlsync-linux-amd64 .
+
+# Windows GUI（需 mingw-w64：brew install mingw-w64）
+CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc GOOS=windows GOARCH=amd64 \
+  go build -trimpath -ldflags='-s -w -H windowsgui' -o dist/sqlsync-windows-amd64.exe .
+```
+
+纯 Go 构建无 GUI 时会自动回退为 CLI 提示（`gui_stub.go`），不影响服务器场景使用。
 
 ## 注意事项与一致性说明
 

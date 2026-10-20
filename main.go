@@ -19,6 +19,7 @@ import (
 )
 
 func main() {
+	enableCLIOutput() // Windows GUI 子系统构建下，CLI 子命令需要附加父控制台才有输出
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
 		case "backup":
