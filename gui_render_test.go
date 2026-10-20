@@ -42,6 +42,7 @@ func TestGUIRenders(t *testing.T) {
 	g.bakDBs.Options = []string{"carlsberg_order_auto_management", "carlsberg_d365_auth", "carlsberg_bakdemo", "shop_archive"}
 	g.bakDBs.Selected = []string{"carlsberg_bakdemo", "carlsberg_d365_auth"}
 	g.bakDBs.Refresh()
+	g.bakCount()
 
 	img := g.win.Canvas().Capture()
 	if img.Bounds().Dx() < 500 || img.Bounds().Dy() < 400 {
@@ -61,6 +62,7 @@ func TestGUIRenders(t *testing.T) {
 	g.rstDBs.Options = []string{"carlsberg_bakdemo", "carlsberg_order_auto_management"}
 	g.rstDBs.Selected = []string{"carlsberg_bakdemo"}
 	g.rstDBs.Refresh()
+	g.rstCount()
 	g.tabs.SelectIndex(1)
 	img2 := g.win.Canvas().Capture()
 	f2, err := os.Create("/tmp/gui_render_restore.png")

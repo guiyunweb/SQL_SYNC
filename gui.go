@@ -6,14 +6,17 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"image/color"
 	"strings"
 	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -42,6 +45,7 @@ type guiApp struct {
 
 	// 进度展示
 	overallBar   *widget.ProgressBar
+	overallPct   *canvas.Text
 	overallLabel *widget.Label
 	logArea      *widget.Entry
 	tasksBox     *fyne.Container
@@ -50,6 +54,8 @@ type guiApp struct {
 
 	bakDBs *widget.CheckGroup // 备份页：服务器数据库勾选列表
 	rstDBs *widget.CheckGroup // 恢复页：备份目录中数据库勾选列表
+
+	bakCount, rstCount func() // 刷新两个勾选列表的“已选 x / y”计数
 	tabs   *container.AppTabs
 
 	status *widget.Label
@@ -86,33 +92,72 @@ func (g *guiApp) buildUI() fyne.CanvasObject {
 	backupTab := g.buildBackupTab()
 	restoreTab := g.buildRestoreTab()
 
-	g.overallLabel = widget.NewLabel("空闲")
-	g.overallBar = widget.NewProgressBar()
-	g.overallBar.Max = 100
-	g.logArea = widget.NewMultiLineEntry()
-	g.logArea.Wrapping = fyne.TextWrapOff
-	g.logArea.SetMinRowsVisible(10)
-	g.status = widget.NewLabel("")
-	g.tasksBox = container.NewVBox()
-	taskScroll := container.NewVScroll(g.tasksBox)
-
-	bottom := container.NewVBox(
-		widget.NewSeparator(),
-		container.NewGridWithColumns(3,
-			widget.NewCard("总体进度", "", container.NewVBox(g.overallBar, g.overallLabel)),
-			widget.NewCard("正在执行的任务", "", taskScroll),
-			widget.NewCard("日志", "", g.logArea),
-		),
-		g.status,
-	)
-
 	g.tabs = container.NewAppTabs(
 		container.NewTabItemWithIcon("备份", theme.DocumentSaveIcon(), backupTab),
 		container.NewTabItemWithIcon("恢复", theme.ViewRestoreIcon(), restoreTab),
 	)
 	g.tabs.SetTabLocation(container.TabLocationTop)
 
-	return container.NewBorder(connPanel, bottom, nil, nil, g.tabs)
+	// 左侧：连接 + 操作页签；右侧：运行监控
+	left := container.NewBorder(connPanel, nil, nil, nil, g.tabs)
+	split := container.NewHSplit(left, g.buildMonitorPanel())
+	split.Offset = 0.56
+
+	g.status = widget.NewLabel("就绪")
+	statusBar := container.NewBorder(nil, nil, widget.NewIcon(theme.InfoIcon()), nil, g.status)
+
+	return container.NewBorder(g.buildHeader(), statusBar, nil, nil, container.NewPadded(split))
+}
+
+// buildHeader 顶部品牌横幅。
+func (g *guiApp) buildHeader() fyne.CanvasObject {
+	bg := canvas.NewRectangle(brandPrimary)
+
+	title := canvas.NewText("SQLSync", color.White)
+	title.TextSize = 22
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	sub := canvas.NewText("MySQL 并行备份 / 恢复工具", color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xCC})
+	sub.TextSize = 13
+
+	row := container.NewHBox(title, container.NewCenter(sub))
+	if len(iconBytes) > 0 {
+		logo := canvas.NewImageFromResource(fyne.NewStaticResource("icon.png", iconBytes))
+		logo.FillMode = canvas.ImageFillContain
+		logo.SetMinSize(fyne.NewSize(30, 30))
+		row = container.NewHBox(logo, title, container.NewCenter(sub))
+	}
+	return container.NewStack(bg, container.NewPadded(container.NewPadded(row)))
+}
+
+// buildMonitorPanel 右侧的运行监控：总体进度、任务列表、日志。
+func (g *guiApp) buildMonitorPanel() fyne.CanvasObject {
+	g.overallPct = canvas.NewText("0%", theme.Color(theme.ColorNamePrimary))
+	g.overallPct.TextSize = 30
+	g.overallPct.TextStyle = fyne.TextStyle{Bold: true}
+	g.overallLabel = widget.NewLabel("空闲")
+	g.overallBar = widget.NewProgressBar()
+	g.overallBar.Max = 100
+	overall := widget.NewCard("总体进度", "", container.NewVBox(
+		container.NewBorder(nil, nil, g.overallPct, nil, container.NewCenter(g.overallLabel)),
+		g.overallBar,
+	))
+
+	g.tasksBox = container.NewVBox()
+	tasks := widget.NewCard("正在执行的任务", "", container.NewVScroll(g.tasksBox))
+
+	g.logArea = widget.NewMultiLineEntry()
+	g.logArea.Wrapping = fyne.TextWrapOff
+	g.logArea.TextStyle = fyne.TextStyle{Monospace: true}
+	g.logArea.SetMinRowsVisible(8)
+	clearLog := widget.NewButtonWithIcon("", theme.ContentClearIcon(), func() { g.logArea.SetText("") })
+	clearLog.Importance = widget.LowImportance
+	logs := widget.NewCard("", "", container.NewBorder(
+		container.NewBorder(nil, nil, widget.NewLabelWithStyle("日志", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), clearLog),
+		nil, nil, nil, g.logArea))
+
+	body := container.NewVSplit(tasks, logs)
+	body.Offset = 0.5
+	return container.NewBorder(overall, nil, nil, nil, body)
 }
 
 // buildConnPanel 顶部的连接配置卡片。
@@ -132,7 +177,7 @@ func (g *guiApp) buildConnPanel() fyne.CanvasObject {
 	g.sslCA = widget.NewEntry()
 	g.sslCA.SetPlaceHolder("CA 证书路径（verify-ca / verify-full 模式）")
 
-	caBtn := widget.NewButton("选择…", func() {
+	caBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		dialog.ShowFileOpen(func(f fyne.URIReadCloser, err error) {
 			if f != nil {
 				g.sslCA.SetText(f.URI().Path())
@@ -141,19 +186,71 @@ func (g *guiApp) buildConnPanel() fyne.CanvasObject {
 	})
 	caBtn.Importance = widget.LowImportance
 
-	testBtn := widget.NewButton("测试连接", func() { g.testConnection() })
+	testBtn := widget.NewButtonWithIcon("测试连接", theme.ConfirmIcon(), func() { g.testConnection() })
 	testBtn.Importance = widget.SuccessImportance
 
+	// 主机与端口同行、用户与密码同行，压缩纵向空间
+	portBox := container.NewGridWrap(fyne.NewSize(90, g.port.MinSize().Height), g.port)
+	server := container.NewBorder(nil, nil, nil,
+		container.NewHBox(widget.NewLabel("端口"), portBox), g.host)
+	account := container.NewGridWithColumns(2, g.user, g.pass)
+	ssl := container.NewBorder(nil, nil, g.sslMode, caBtn, g.sslCA)
+
 	form := widget.NewForm(
-		widget.NewFormItem("主机", g.host),
-		widget.NewFormItem("端口", g.port),
-		widget.NewFormItem("用户", g.user),
-		widget.NewFormItem("密码", g.pass),
-		widget.NewFormItem("SSL 模式", g.sslMode),
-		widget.NewFormItem("CA 证书", container.NewBorder(nil, nil, nil, caBtn, g.sslCA)),
-		widget.NewFormItem("", container.NewHBox(testBtn)),
+		widget.NewFormItem("服务器", server),
+		widget.NewFormItem("用户/密码", account),
+		widget.NewFormItem("SSL", ssl),
 	)
-	return widget.NewCard("数据库连接", "备份/恢复共用的服务器参数", form)
+	return widget.NewCard("", "", container.NewBorder(
+		container.NewBorder(nil, nil, sectionTitle(theme.ComputerIcon(), "数据库连接"), testBtn),
+		nil, nil, nil, form))
+}
+
+// sectionTitle 带图标的粗体分组标题。
+func sectionTitle(icon fyne.Resource, text string) fyne.CanvasObject {
+	return container.NewHBox(widget.NewIcon(icon),
+		widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+}
+
+// actionBar 页签底部固定的操作按钮栏，靠右对齐。
+func actionBar(hint fyne.CanvasObject, buttons ...fyne.CanvasObject) fyne.CanvasObject {
+	objs := append([]fyne.CanvasObject{hint, layout.NewSpacer()}, buttons...)
+	return container.NewVBox(widget.NewSeparator(), container.NewHBox(objs...))
+}
+
+// dbPicker 数据库勾选卡片：工具按钮 + 已选计数 + 滚动列表。
+// 返回的 refresh 用于代码直接改写 Options/Selected 之后同步计数。
+func dbPicker(cg *widget.CheckGroup, hint string, minH float32, tools ...fyne.CanvasObject) (fyne.CanvasObject, func()) {
+	count := widget.NewLabel("")
+	update := func() {
+		if len(cg.Selected) == 0 {
+			count.SetText(fmt.Sprintf("共 %d 个 · 未勾选（%s）", len(cg.Options), hint))
+		} else {
+			count.SetText(fmt.Sprintf("已选 %d / %d", len(cg.Selected), len(cg.Options)))
+		}
+	}
+	cg.OnChanged = func([]string) { update() }
+	update()
+
+	allBtn := widget.NewButtonWithIcon("全选", theme.CheckButtonCheckedIcon(), func() {
+		cg.Selected = append([]string(nil), cg.Options...)
+		cg.Refresh()
+		update()
+	})
+	clearBtn := widget.NewButtonWithIcon("清空", theme.CheckButtonIcon(), func() {
+		cg.Selected = nil
+		cg.Refresh()
+		update()
+	})
+	allBtn.Importance = widget.LowImportance
+	clearBtn.Importance = widget.LowImportance
+
+	scroll := container.NewVScroll(cg)
+	scroll.SetMinSize(fyne.NewSize(0, minH))
+	toolbar := container.NewHBox(append(tools, layout.NewSpacer(), allBtn, clearBtn)...)
+	return widget.NewCard("", "", container.NewBorder(
+		container.NewVBox(sectionTitle(theme.StorageIcon(), "数据库选择"), toolbar),
+		count, nil, nil, scroll)), update
 }
 
 func labelWith(name string, obj fyne.CanvasObject) *fyne.Container {
@@ -163,23 +260,15 @@ func labelWith(name string, obj fyne.CanvasObject) *fyne.Container {
 // buildBackupTab 备份页签。
 func (g *guiApp) buildBackupTab() fyne.CanvasObject {
 	g.bakDBs = widget.NewCheckGroup(nil, nil)
-	dbScroll := container.NewVScroll(g.bakDBs)
-	dbScroll.SetMinSize(fyne.NewSize(0, 190))
-	loadBtn := widget.NewButton("从服务器获取数据库列表", func() { g.loadServerDatabases() })
-	allBtn := widget.NewButton("全选", func() {
-		g.bakDBs.Selected = append([]string(nil), g.bakDBs.Options...)
-		g.bakDBs.Refresh()
-	})
-	clearBtn := widget.NewButton("清空", func() {
-		g.bakDBs.Selected = nil
-		g.bakDBs.Refresh()
-	})
+	loadBtn := widget.NewButtonWithIcon("从服务器获取", theme.ViewRefreshIcon(), func() { g.loadServerDatabases() })
+	var picker fyne.CanvasObject
+	picker, g.bakCount = dbPicker(g.bakDBs, "将备份全部非系统库", 190, loadBtn)
 
 	tables := widget.NewEntry()
 	tables.SetPlaceHolder("逗号分隔的表名，留空 = 每个勾选库的全部表")
 	outDir := widget.NewEntry()
 	outDir.SetText("./backups")
-	dirBtn := widget.NewButton("选择…", func() {
+	dirBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(f fyne.ListableURI, err error) {
 			if f != nil {
 				outDir.SetText(f.Path())
@@ -200,7 +289,7 @@ func (g *guiApp) buildBackupTab() fyne.CanvasObject {
 	gzipChk.SetChecked(true)
 
 	var startBtn *widget.Button
-	startBtn = widget.NewButton("开始备份", func() {
+	startBtn = widget.NewButtonWithIcon("开始备份", theme.MediaPlayIcon(), func() {
 		cfg, err := g.connConfig()
 		if err != nil {
 			dialog.ShowError(err, g.win)
@@ -227,30 +316,31 @@ func (g *guiApp) buildBackupTab() fyne.CanvasObject {
 		})
 	})
 	startBtn.Importance = widget.HighImportance
-	cancelBtn := widget.NewButton("取消", func() { g.cancelTask() })
+	cancelBtn := widget.NewButtonWithIcon("取消", theme.CancelIcon(), func() { g.cancelTask() })
 	cancelBtn.Importance = widget.DangerImportance
 
-	paramForm := widget.NewForm(
+	// 路径类参数占整行，数值类调优参数两列排布
+	pathForm := widget.NewForm(
 		widget.NewFormItem("输出目录", container.NewBorder(nil, nil, nil, dirBtn, outDir)),
 		widget.NewFormItem("表过滤", tables),
-		widget.NewFormItem("并行数", workers),
-		widget.NewFormItem("分片阈值(行)", shardMin),
-		widget.NewFormItem("最大分片", shardMax),
-		widget.NewFormItem("块行数", chunkRows),
-		widget.NewFormItem("每 INSERT 行数", rowsPerInsert),
-		widget.NewFormItem("压缩", gzipChk),
 	)
+	tuning := container.NewGridWithColumns(2,
+		widget.NewForm(
+			widget.NewFormItem("并行数", workers),
+			widget.NewFormItem("分片阈值(行)", shardMin),
+			widget.NewFormItem("最大分片", shardMax),
+		),
+		widget.NewForm(
+			widget.NewFormItem("块行数", chunkRows),
+			widget.NewFormItem("每 INSERT 行数", rowsPerInsert),
+			widget.NewFormItem("压缩", gzipChk),
+		),
+	)
+	params := widget.NewCard("", "", container.NewVBox(
+		sectionTitle(theme.SettingsIcon(), "备份参数"), pathForm, widget.NewSeparator(), tuning))
 
-	form := container.NewVBox(
-		widget.NewCard("备份参数", "", paramForm),
-		widget.NewCard("数据库选择", "不勾任何项 = 全部非系统库",
-			container.NewVBox(
-				container.NewHBox(loadBtn, allBtn, clearBtn),
-				dbScroll,
-				container.NewHBox(startBtn, cancelBtn),
-			)),
-	)
-	return container.NewVScroll(form)
+	body := container.NewVScroll(container.NewVBox(params, picker))
+	return container.NewBorder(nil, actionBar(layout.NewSpacer(), cancelBtn, startBtn), nil, nil, body)
 }
 
 // loadServerDatabases 连接服务器拉取非系统库列表填充到勾选框。
@@ -272,6 +362,7 @@ func (g *guiApp) loadServerDatabases() {
 			g.bakDBs.Options = dbs
 			g.bakDBs.Selected = nil
 			g.bakDBs.Refresh()
+			g.bakCount()
 			g.appendLog(fmt.Sprintf("已获取 %d 个数据库", len(dbs)))
 		})
 	}()
@@ -283,8 +374,6 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 	dir.SetPlaceHolder("备份目录（根目录或某库子目录）")
 
 	g.rstDBs = widget.NewCheckGroup(nil, nil)
-	dbScroll := container.NewVScroll(g.rstDBs)
-	dbScroll.SetMinSize(fyne.NewSize(0, 170))
 
 	scan := func() {
 		p := strings.TrimSpace(dir.Text)
@@ -304,9 +393,10 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 		g.rstDBs.Options = names
 		g.rstDBs.Selected = nil
 		g.rstDBs.Refresh()
+		g.rstCount()
 		g.appendLog(fmt.Sprintf("备份目录中发现 %d 个数据库: %s", len(names), strings.Join(names, ", ")))
 	}
-	dirBtn := widget.NewButton("选择…", func() {
+	dirBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		dialog.ShowFolderOpen(func(f fyne.ListableURI, err error) {
 			if f != nil {
 				dir.SetText(f.Path())
@@ -314,15 +404,9 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 			}
 		}, g.win)
 	})
-	scanBtn := widget.NewButton("扫描目录", scan)
-	allBtn := widget.NewButton("全选", func() {
-		g.rstDBs.Selected = append([]string(nil), g.rstDBs.Options...)
-		g.rstDBs.Refresh()
-	})
-	clearBtn := widget.NewButton("清空", func() {
-		g.rstDBs.Selected = nil
-		g.rstDBs.Refresh()
-	})
+	scanBtn := widget.NewButtonWithIcon("扫描目录", theme.SearchIcon(), scan)
+	var picker fyne.CanvasObject
+	picker, g.rstCount = dbPicker(g.rstDBs, "将恢复目录内全部", 170, scanBtn)
 
 	rename := widget.NewEntry()
 	rename.SetPlaceHolder("库改名映射，如 old:new，多个逗号分隔")
@@ -335,7 +419,7 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 	recreateChk := widget.NewCheck("恢复前 DROP 目标库（危险）", nil)
 
 	var startBtn *widget.Button
-	startBtn = widget.NewButton("开始恢复", func() {
+	startBtn = widget.NewButtonWithIcon("开始恢复", theme.MediaPlayIcon(), func() {
 		if recreateChk.Checked {
 			dialog.ShowConfirm("危险操作",
 				"将先 DROP 目标库再恢复，现有数据会丢失。确定继续？", func(ok bool) {
@@ -348,27 +432,34 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 		g.doRestore(dir, rename, workers, commitBatch, createChk.Checked, false, startBtn)
 	})
 	startBtn.Importance = widget.HighImportance
-	cancelBtn := widget.NewButton("取消", func() { g.cancelTask() })
+	cancelBtn := widget.NewButtonWithIcon("取消", theme.CancelIcon(), func() { g.cancelTask() })
 	cancelBtn.Importance = widget.DangerImportance
 
-	paramForm := widget.NewForm(
+	pathForm := widget.NewForm(
 		widget.NewFormItem("备份目录", container.NewBorder(nil, nil, nil, dirBtn, dir)),
 		widget.NewFormItem("改名映射", rename),
-		widget.NewFormItem("并行数", workers),
-		widget.NewFormItem("批量提交", commitBatch),
-		widget.NewFormItem("", container.NewHBox(createChk, recreateChk)),
 	)
+	tuning := container.NewGridWithColumns(2,
+		widget.NewForm(widget.NewFormItem("并行数", workers)),
+		widget.NewForm(widget.NewFormItem("批量提交", commitBatch)),
+	)
+	params := widget.NewCard("", "", container.NewVBox(
+		sectionTitle(theme.SettingsIcon(), "恢复参数"), pathForm, widget.NewSeparator(), tuning,
+		container.NewHBox(createChk, recreateChk)))
 
-	form := container.NewVBox(
-		widget.NewCard("恢复参数", "", paramForm),
-		widget.NewCard("数据库选择", "不勾任何项 = 目录内全部",
-			container.NewVBox(
-				container.NewHBox(scanBtn, allBtn, clearBtn),
-				dbScroll,
-				container.NewHBox(startBtn, cancelBtn),
-			)),
-	)
-	return container.NewVScroll(form)
+	// 勾选 DROP 时在操作栏显示醒目警示
+	warn := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	warn.Importance = widget.DangerImportance
+	recreateChk.OnChanged = func(on bool) {
+		if on {
+			warn.SetText("⚠ 将先 DROP 目标库")
+		} else {
+			warn.SetText("")
+		}
+	}
+
+	body := container.NewVScroll(container.NewVBox(params, picker))
+	return container.NewBorder(nil, actionBar(warn, cancelBtn, startBtn), nil, nil, body)
 }
 
 func (g *guiApp) doRestore(dir, rename, workers, commitBatch *widget.Entry,
@@ -517,11 +608,13 @@ func (g *guiApp) applyEvent(e progress.Event) {
 		if r, ok := g.taskRows[e.Task]; ok {
 			r.done = true
 			r.bar.SetValue(100)
+			r.label.Importance = widget.SuccessImportance
 			r.label.SetText(fmt.Sprintf("✔ %s  %s", e.Task, e.Message))
 			g.trimRows()
 		}
 	case progress.KindTaskFail:
 		if r, ok := g.taskRows[e.Task]; ok {
+			r.label.Importance = widget.DangerImportance
 			r.label.SetText(fmt.Sprintf("✗ %s  %s", e.Task, e.Message))
 		}
 		g.appendLog("✗ " + e.Task + " " + e.Message)
@@ -539,6 +632,7 @@ func (g *guiApp) upsertTask(task string, e progress.Event) {
 	if !ok {
 		r = &taskRow{label: widget.NewLabel(task), bar: widget.NewProgressBar()}
 		r.bar.Max = 100
+		r.label.Truncation = fyne.TextTruncateEllipsis
 		r.box = container.NewVBox(r.label, r.bar)
 		g.taskRows[task] = r
 		g.rowOrder = append(g.rowOrder, task)
@@ -578,6 +672,8 @@ func (g *guiApp) clearTasks() {
 
 func (g *guiApp) setOverall(pct float64, text string) {
 	g.overallBar.SetValue(pct)
+	g.overallPct.Text = fmt.Sprintf("%.0f%%", pct)
+	g.overallPct.Refresh()
 	g.overallLabel.SetText(text)
 	g.status.SetText(text)
 }
