@@ -57,7 +57,14 @@ func runGUI() {
 	a := app.NewWithID("com.sqlsync.gui")
 	g := &guiApp{app: a, taskRows: map[string]*taskRow{}}
 	g.win = a.NewWindow("SQLSync —— MySQL 备份 / 恢复")
+	content := g.buildUI()
+	g.win.SetContent(content)
+	g.win.Resize(fyne.NewSize(1200, 820))
+	g.win.ShowAndRun()
+}
 
+// buildUI 组装主界面（独立出来便于离屏渲染测试）。
+func (g *guiApp) buildUI() fyne.CanvasObject {
 	connPanel := g.buildConnPanel()
 	g.applyPrefs() // 控件创建后填充上次输入
 
@@ -66,6 +73,7 @@ func runGUI() {
 
 	g.overallLabel = widget.NewLabel("空闲")
 	g.overallBar = widget.NewProgressBar()
+	g.overallBar.Max = 100
 	g.logArea = widget.NewMultiLineEntry()
 	g.logArea.Wrapping = fyne.TextWrapOff
 	g.logArea.SetMinRowsVisible(10)
@@ -88,10 +96,7 @@ func runGUI() {
 		container.NewTabItem("恢复", restoreTab),
 	)
 
-	content := container.NewBorder(connPanel, bottom, nil, nil, tabs)
-	g.win.SetContent(content)
-	g.win.Resize(fyne.NewSize(1200, 820))
-	g.win.ShowAndRun()
+	return container.NewBorder(connPanel, bottom, nil, nil, tabs)
 }
 
 // buildConnPanel 顶部的连接配置区。
