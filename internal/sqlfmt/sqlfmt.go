@@ -44,12 +44,14 @@ func QuoteIdent(s string) string {
 // ColumnKind 对列类型归类：数字 / 十六进制 / 其余按字符串转义。
 func ColumnKind(dbTypeName string) string {
 	t := strings.ToUpper(dbTypeName)
-	// 去掉可能的长度/修饰，如 "INT UNSIGNED"
+	// 按空格分词处理 "INT UNSIGNED"、"BIGINT UNSIGNED" 等修饰组合
+	for _, tok := range strings.Fields(t) {
+		if numericTypes[tok] {
+			return "num"
+		}
+	}
 	if i := strings.IndexByte(t, ' '); i >= 0 {
 		t = t[:i]
-	}
-	if numericTypes[t] {
-		return "num"
 	}
 	if hexTypes[t] {
 		return "hex"
