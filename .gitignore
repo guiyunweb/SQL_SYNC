@@ -1,0 +1,16 @@
+# 编译产物
+/sqlsync
+/bin/
+/dist/
+
+# 备份输出
+/backups/
+/*.sql
+/*.sql.gz
+
+# 测试临时目录
+/tmp/
+
+# IDE
+.idea/
+.vscode/
