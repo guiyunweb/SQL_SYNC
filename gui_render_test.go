@@ -36,6 +36,11 @@ func TestGUIRenders(t *testing.T) {
 		g.applyEvent(e)
 	}
 
+	// 模拟数据库勾选列表（备份页）
+	g.bakDBs.Options = []string{"carlsberg_order_auto_management", "carlsberg_d365_auth", "carlsberg_bakdemo", "shop_archive"}
+	g.bakDBs.Selected = []string{"carlsberg_bakdemo", "carlsberg_d365_auth"}
+	g.bakDBs.Refresh()
+
 	img := g.win.Canvas().Capture()
 	if img.Bounds().Dx() < 500 || img.Bounds().Dy() < 400 {
 		t.Fatalf("渲染尺寸异常: %v", img.Bounds())
@@ -48,5 +53,21 @@ func TestGUIRenders(t *testing.T) {
 	if err := png.Encode(f, img); err != nil {
 		t.Fatal(err)
 	}
-	t.Log("渲染截图已写入 /tmp/gui_render_test.png", img.Bounds())
+	t.Log("备份页渲染截图已写入 /tmp/gui_render_test.png", img.Bounds())
+
+	// 切到恢复页再截一张
+	g.rstDBs.Options = []string{"carlsberg_bakdemo", "carlsberg_order_auto_management"}
+	g.rstDBs.Selected = []string{"carlsberg_bakdemo"}
+	g.rstDBs.Refresh()
+	g.tabs.SelectIndex(1)
+	img2 := g.win.Canvas().Capture()
+	f2, err := os.Create("/tmp/gui_render_restore.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+	if err := png.Encode(f2, img2); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("恢复页渲染截图已写入 /tmp/gui_render_restore.png", img2.Bounds())
 }

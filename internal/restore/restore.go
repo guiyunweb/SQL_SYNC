@@ -147,13 +147,47 @@ func Run(ctx context.Context, cfg dbconn.Config, o Options) error {
 	return nil
 }
 
+// isDBDir 判断目录是否是一个数据库备份目录（含 schema.sql）。
+func isDBDir(dir string) bool {
+	st, err := os.Stat(filepath.Join(dir, "schema.sql"))
+	return err == nil && !st.IsDir()
+}
+
+// backupName 返回一个库目录对应的库名：meta.json 里的原库名优先，否则用目录名。
+func backupName(dir string) string {
+	name := filepath.Base(dir)
+	var m Meta
+	if raw, err := os.ReadFile(filepath.Join(dir, "meta.json")); err == nil {
+		_ = json.Unmarshal(raw, &m)
+		if m.Database != "" {
+			name = m.Database
+		}
+	}
+	return name
+}
+
+// ListBackedUpDatabases 列出备份目录中全部可恢复的数据库名（供 GUI 勾选列表使用）。
+// dir 可以是备份根目录，也可以是某个库的备份子目录。
+func ListBackedUpDatabases(dir string) ([]string, error) {
+	if isDBDir(dir) {
+		return []string{backupName(dir)}, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() && isDBDir(filepath.Join(dir, e.Name())) {
+			out = append(out, backupName(filepath.Join(dir, e.Name())))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // discover 在 Dir 下找到全部库目录。
 func discover(o Options) ([]dbDir, error) {
-	isDBDir := func(dir string) bool {
-		st, err := os.Stat(filepath.Join(dir, "schema.sql"))
-		return err == nil && !st.IsDir()
-	}
-
 	var dirs []struct{ name, path string }
 	if isDBDir(o.Dir) {
 		dirs = append(dirs, struct{ name, path string }{filepath.Base(o.Dir), o.Dir})

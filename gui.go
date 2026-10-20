@@ -41,6 +41,10 @@ type guiApp struct {
 	taskRows     map[string]*taskRow
 	rowOrder     []string
 
+	bakDBs *widget.CheckGroup // 备份页：服务器数据库勾选列表
+	rstDBs *widget.CheckGroup // 恢复页：备份目录中数据库勾选列表
+	tabs   *container.AppTabs
+
 	status *widget.Label
 }
 
@@ -91,12 +95,12 @@ func (g *guiApp) buildUI() fyne.CanvasObject {
 		g.status,
 	)
 
-	tabs := container.NewAppTabs(
+	g.tabs = container.NewAppTabs(
 		container.NewTabItem("备份", backupTab),
 		container.NewTabItem("恢复", restoreTab),
 	)
 
-	return container.NewBorder(connPanel, bottom, nil, nil, tabs)
+	return container.NewBorder(connPanel, bottom, nil, nil, g.tabs)
 }
 
 // buildConnPanel 顶部的连接配置区。
@@ -143,10 +147,21 @@ func labelWith(name string, obj fyne.CanvasObject) *fyne.Container {
 
 // buildBackupTab 备份页签。
 func (g *guiApp) buildBackupTab() fyne.CanvasObject {
-	databases := widget.NewEntry()
-	databases.SetPlaceHolder("逗号分隔的库名，留空 = 全部非系统库")
+	g.bakDBs = widget.NewCheckGroup(nil, nil)
+	dbScroll := container.NewVScroll(g.bakDBs)
+	dbScroll.SetMinSize(fyne.NewSize(0, 190))
+	loadBtn := widget.NewButton("从服务器获取数据库列表", func() { g.loadServerDatabases() })
+	allBtn := widget.NewButton("全选", func() {
+		g.bakDBs.Selected = append([]string(nil), g.bakDBs.Options...)
+		g.bakDBs.Refresh()
+	})
+	clearBtn := widget.NewButton("清空", func() {
+		g.bakDBs.Selected = nil
+		g.bakDBs.Refresh()
+	})
+
 	tables := widget.NewEntry()
-	tables.SetPlaceHolder("逗号分隔的表名，留空 = 全部表")
+	tables.SetPlaceHolder("逗号分隔的表名，留空 = 每个勾选库的全部表")
 	outDir := widget.NewEntry()
 	outDir.SetText("./backups")
 	dirBtn := widget.NewButton("选择…", func() {
@@ -178,7 +193,7 @@ func (g *guiApp) buildBackupTab() fyne.CanvasObject {
 		}
 		o := backup.Options{
 			OutDir:        strings.TrimSpace(outDir.Text),
-			Databases:     splitCSV(databases.Text),
+			Databases:     append([]string(nil), g.bakDBs.Selected...),
 			Tables:        splitCSV(tables.Text),
 			Workers:       atoiDefault(workers.Text, 8),
 			ShardMinRows:  int64(atoiDefault(shardMin.Text, 2_000_000)),
@@ -200,7 +215,9 @@ func (g *guiApp) buildBackupTab() fyne.CanvasObject {
 
 	form := container.NewVBox(
 		labelWith("输出目录", container.NewBorder(nil, nil, nil, dirBtn, outDir)),
-		labelWith("数据库", databases),
+		widget.NewLabelWithStyle("数据库选择（不勾任何项 = 全部非系统库）", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(loadBtn, allBtn, clearBtn),
+		dbScroll,
 		labelWith("表过滤", tables),
 		container.NewGridWithColumns(4,
 			labelWith("并行数", workers), labelWith("分片阈值(行)", shardMin),
@@ -211,19 +228,77 @@ func (g *guiApp) buildBackupTab() fyne.CanvasObject {
 	return container.NewVScroll(form)
 }
 
+// loadServerDatabases 连接服务器拉取非系统库列表填充到勾选框。
+func (g *guiApp) loadServerDatabases() {
+	cfg, err := g.connConfig()
+	if err != nil {
+		dialog.ShowError(err, g.win)
+		return
+	}
+	g.appendLog("正在获取数据库列表…")
+	go func() {
+		dbs, err := dbconn.ListDatabases(cfg)
+		fyne.Do(func() {
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("获取数据库列表失败: %w", err), g.win)
+				g.appendLog("获取数据库列表失败: " + err.Error())
+				return
+			}
+			g.bakDBs.Options = dbs
+			g.bakDBs.Selected = nil
+			g.bakDBs.Refresh()
+			g.appendLog(fmt.Sprintf("已获取 %d 个数据库", len(dbs)))
+		})
+	}()
+}
+
 // buildRestoreTab 恢复页签。
 func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 	dir := widget.NewEntry()
 	dir.SetPlaceHolder("备份目录（根目录或某库子目录）")
+
+	g.rstDBs = widget.NewCheckGroup(nil, nil)
+	dbScroll := container.NewVScroll(g.rstDBs)
+	dbScroll.SetMinSize(fyne.NewSize(0, 170))
+
+	scan := func() {
+		p := strings.TrimSpace(dir.Text)
+		if p == "" {
+			dialog.ShowError(fmt.Errorf("请先选择备份目录"), g.win)
+			return
+		}
+		names, err := restore.ListBackedUpDatabases(p)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("扫描备份目录失败: %w", err), g.win)
+			return
+		}
+		if len(names) == 0 {
+			dialog.ShowInformation("提示", "该目录中没有可恢复的数据库（缺少 schema.sql）", g.win)
+			return
+		}
+		g.rstDBs.Options = names
+		g.rstDBs.Selected = nil
+		g.rstDBs.Refresh()
+		g.appendLog(fmt.Sprintf("备份目录中发现 %d 个数据库: %s", len(names), strings.Join(names, ", ")))
+	}
 	dirBtn := widget.NewButton("选择…", func() {
 		dialog.ShowFolderOpen(func(f fyne.ListableURI, err error) {
 			if f != nil {
 				dir.SetText(f.Path())
+				scan()
 			}
 		}, g.win)
 	})
-	databases := widget.NewEntry()
-	databases.SetPlaceHolder("只恢复这些库（逗号分隔，留空 = 目录内全部）")
+	scanBtn := widget.NewButton("扫描目录", scan)
+	allBtn := widget.NewButton("全选", func() {
+		g.rstDBs.Selected = append([]string(nil), g.rstDBs.Options...)
+		g.rstDBs.Refresh()
+	})
+	clearBtn := widget.NewButton("清空", func() {
+		g.rstDBs.Selected = nil
+		g.rstDBs.Refresh()
+	})
+
 	rename := widget.NewEntry()
 	rename.SetPlaceHolder("库改名映射，如 old:new，多个逗号分隔")
 	workers := widget.NewEntry()
@@ -240,18 +315,20 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 			dialog.ShowConfirm("危险操作",
 				"将先 DROP 目标库再恢复，现有数据会丢失。确定继续？", func(ok bool) {
 					if ok {
-						g.doRestore(dir, databases, rename, workers, commitBatch, createChk.Checked, true, startBtn)
+						g.doRestore(dir, rename, workers, commitBatch, createChk.Checked, true, startBtn)
 					}
 				}, g.win)
 			return
 		}
-		g.doRestore(dir, databases, rename, workers, commitBatch, createChk.Checked, false, startBtn)
+		g.doRestore(dir, rename, workers, commitBatch, createChk.Checked, false, startBtn)
 	})
 	cancelBtn := widget.NewButton("取消", func() { g.cancelTask() })
 
 	form := container.NewVBox(
 		labelWith("备份目录", container.NewBorder(nil, nil, nil, dirBtn, dir)),
-		labelWith("数据库", databases),
+		widget.NewLabelWithStyle("数据库选择（不勾任何项 = 目录内全部）", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(scanBtn, allBtn, clearBtn),
+		dbScroll,
 		labelWith("改名映射", rename),
 		container.NewGridWithColumns(2, labelWith("并行数", workers), labelWith("批量提交", commitBatch)),
 		container.NewHBox(createChk, recreateChk),
@@ -260,7 +337,7 @@ func (g *guiApp) buildRestoreTab() fyne.CanvasObject {
 	return container.NewVScroll(form)
 }
 
-func (g *guiApp) doRestore(dir, databases, rename, workers, commitBatch *widget.Entry,
+func (g *guiApp) doRestore(dir, rename, workers, commitBatch *widget.Entry,
 	create, recreate bool, startBtn *widget.Button) {
 
 	cfg, err := g.connConfig()
@@ -284,7 +361,7 @@ func (g *guiApp) doRestore(dir, databases, rename, workers, commitBatch *widget.
 
 	o := restore.Options{
 		Dir:         strings.TrimSpace(dir.Text),
-		Databases:   splitCSV(databases.Text),
+		Databases:   append([]string(nil), g.rstDBs.Selected...),
 		Rename:      renameMap,
 		Create:      create,
 		Recreate:    recreate,

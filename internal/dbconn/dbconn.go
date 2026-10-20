@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -122,4 +123,37 @@ func Open(c Config) (*sql.DB, error) {
 // URL 返回便于日志展示的脱敏地址。
 func (c *Config) URL() string {
 	return fmt.Sprintf("%s@%s:%d/%s", url.QueryEscape(c.User), c.Host, c.Port, c.Database)
+}
+
+// systemSchemas 不展示/不导出的系统库。
+var systemSchemas = map[string]bool{
+	"mysql": true, "sys": true, "information_schema": true, "performance_schema": true,
+}
+
+// ListDatabases 连接服务器并列出全部非系统数据库（供 GUI 勾选列表使用）。
+func ListDatabases(c Config) ([]string, error) {
+	noDB := c
+	noDB.Database = ""
+	db, err := Open(noDB)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		if !systemSchemas[strings.ToLower(s)] {
+			out = append(out, s)
+		}
+	}
+	return out, rows.Err()
 }
