@@ -5,8 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -24,15 +23,10 @@ func stripDBQualifier(ddl, schema string) string {
 	return strings.ReplaceAll(ddl, "`"+schema+"`.", "")
 }
 
-// dumpSchema 把表、视图、触发器、存储过程、函数、事件的定义写入 dir/schema.sql。
+// dumpSchema 把表、视图、触发器、存储过程、函数、事件的定义写入 out（即包内 <库>/schema.sql）。
 // 每条语句用标记包裹，触发器/过程体内的分号不会干扰恢复切分。
-func dumpSchema(ctx context.Context, db *sql.DB, schema, dir string, tables []tableInfo, o Options) error {
-	f, err := os.Create(filepath.Join(dir, "schema.sql"))
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w := bufio.NewWriterSize(f, 1<<20)
+func dumpSchema(ctx context.Context, db *sql.DB, schema string, out io.Writer, tables []tableInfo, o Options) error {
+	w := bufio.NewWriterSize(out, 1<<20)
 
 	write := func(s string) error {
 		_, err := w.WriteString(s)

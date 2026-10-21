@@ -6,11 +6,12 @@
 //	sqlsync backup  [参数]       命令行备份
 //	sqlsync restore [参数]       命令行恢复
 //
-// 备份输出布局:
+// 备份输出为单个 <out>/sqlsync_<库名|multi>_<时间>.tar.gz，包内布局:
 //
-//	<out>/<库名>/schema.sql          表结构（含视图/触发器/存储过程/事件）
-//	<out>/<库名>/data/<表名>.sql.gz   数据（每行一条多值 INSERT）
-//	<out>/<库名>/meta.json           备份元数据
+//	sqlsync.json                       清单（包含哪些库，恢复端只读它即可列库）
+//	<库名>/schema.sql                  表结构（含视图/触发器/存储过程/事件）
+//	<库名>/data/<表名>/<分片>-<序号>.sql 数据（每行一条多值 INSERT，约 8MB 一个条目）
+//	<库名>/meta.json                   备份元数据（实际行数）
 package main
 
 import (
@@ -19,6 +20,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "__job" { // GUI 拉起的后台任务进程
+		runJobWorker(os.Args[2])
+		return
+	}
 	enableCLIOutput() // Windows GUI 子系统构建下，CLI 子命令需要附加父控制台才有输出
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
@@ -46,8 +51,8 @@ func printUsage() {
 
 用法:
   sqlsync                  启动桌面 GUI
-  sqlsync backup  [flags]  备份：表结构写入 schema.sql，数据写入 data/*.sql.gz
-  sqlsync restore [flags]  恢复：先结构后数据，并行灌入
+  sqlsync backup  [flags]  备份：所有库打包为单个 .tar.gz
+  sqlsync restore [flags]  恢复：读取 .tar.gz，先结构后数据，并行灌入
 
 公共连接参数:
   -host          MySQL 主机 (默认 127.0.0.1)
@@ -58,18 +63,17 @@ func printUsage() {
   -ssl-ca        CA 证书路径（verify-ca / verify-full 模式必填）
 
 backup 参数:
-  -out           输出目录 (默认 ./backups)
+  -out           备份包输出目录 (默认 ./backups)
   -databases     逗号分隔的库名；默认备份全部非系统库
   -tables        逗号分隔的表名；默认库内全部表
   -workers       并行 worker 数 (默认 8)
-  -chunk-rows    每次 SELECT 拉取行数 (默认 2000)
   -rows-per-insert 每条 INSERT 最多行数 (默认 500)
-  -shard-min-rows 超过该行数且含数值单列主键时按主键分片 (默认 2000000)
-  -shard-max     单表最大分片数 (默认 8)
-  -gzip          输出 gzip 压缩 (默认 true)
+  -shard-min-rows 每个分片的目标行数；含数值单列主键的大表按主键分片 (默认 500000)
+  -shard-max     单表最大分片数 (默认 16)
+  -level         gzip 压缩级别 1-9 (默认 1，最快)
 
 restore 参数:
-  -dir           备份目录（根目录或某个库目录）
+  -file          备份包 .tar.gz（也兼容旧版备份目录；-dir 为同义参数）
   -databases     只恢复指定的库（按备份中的库名）
   -rename        库改名映射，如 old:new（可重复，逗号分隔）
   -create        目标库不存在时自动创建 (默认 true)
@@ -79,5 +83,5 @@ restore 参数:
 
 示例:
   sqlsync backup -host 116.176.114.10 -port 24218 -u root -p xxx -ssl-mode skip-verify -out ./backups
-  sqlsync restore -host 116.176.114.10 -port 24218 -u root -p xxx -dir ./backups -rename db1:db1_copy`)
+  sqlsync restore -host 116.176.114.10 -port 24218 -u root -p xxx -file ./backups/sqlsync_db1_20261020_120000.tar.gz -rename db1:db1_copy`)
 }

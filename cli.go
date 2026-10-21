@@ -50,16 +50,33 @@ func ctxWithSignal() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
+var lastOverall time.Time
+
+// overallPercent 把总体进度事件格式化为百分比；预估总量偏小时封顶 99%。
+func overallPercent(e progress.Event) string {
+	if e.Total <= 0 {
+		return "--"
+	}
+	p := float64(e.Done) / float64(e.Total) * 100
+	if p >= 100 && e.Done != e.Total {
+		p = 99
+	}
+	return fmt.Sprintf("%3.0f%%", min(p, 100))
+}
+
 // consoleReporter 把进度事件输出到终端。
 func consoleReporter(e progress.Event) {
 	ts := time.Now().Format("15:04:05")
 	// 只打印关键事件，导出中的高频进度更新降频打印
 	switch e.Kind {
 	case progress.KindTaskUpdate:
-		if e.Done > 0 && e.Done%200000 != 0 {
+		return // 单任务高频进度只给 GUI 用，终端看总体进度即可
+	case progress.KindOverall:
+		if time.Since(lastOverall) < 5*time.Second && e.Done < e.Total {
 			return
 		}
-		fmt.Printf("[%s] [进度] %s: %s (已处理 %d 行)\n", ts, e.Task, e.Message, e.Done)
+		lastOverall = time.Now()
+		fmt.Printf("[%s] [总体 %s] %s\n", ts, overallPercent(e), e.Message)
 	case progress.KindTaskStart, progress.KindTaskDone, progress.KindTaskFail, progress.KindSummary:
 		fmt.Printf("[%s] %s %s\n", ts, e.Task, e.Message)
 	default:
@@ -73,19 +90,20 @@ func runBackupCLI(args []string) {
 	connFlags(fs, &cfg)
 
 	var outDir, databases, tables string
-	var workers, chunkRows, rowsPerInsert, shardMax int
+	var workers, rowsPerInsert, shardMax, level int
 	var shardMinRows int64
-	var gzipOut bool
 
-	fs.StringVar(&outDir, "out", "./backups", "输出目录")
+	fs.StringVar(&outDir, "out", "./backups", "备份包输出目录")
 	fs.StringVar(&databases, "databases", "", "逗号分隔的库名；默认全部非系统库")
 	fs.StringVar(&tables, "tables", "", "逗号分隔的表名；默认全部表")
 	fs.IntVar(&workers, "workers", 8, "并行 worker 数")
-	fs.IntVar(&chunkRows, "chunk-rows", 2000, "每次 SELECT 拉取行数")
 	fs.IntVar(&rowsPerInsert, "rows-per-insert", 500, "每条 INSERT 最多行数")
-	fs.Int64Var(&shardMinRows, "shard-min-rows", 2_000_000, "大表主键分片阈值")
-	fs.IntVar(&shardMax, "shard-max", 8, "单表最大分片数")
-	fs.BoolVar(&gzipOut, "gzip", true, "输出 gzip 压缩")
+	fs.Int64Var(&shardMinRows, "shard-min-rows", 500_000, "每个分片的目标行数")
+	fs.IntVar(&shardMax, "shard-max", 16, "单表最大分片数")
+	fs.IntVar(&level, "level", 1, "gzip 压缩级别 1-9（1 最快）")
+	// 已废弃：改为流式读取 + 单个 .tar.gz 输出后不再需要，保留以兼容旧脚本
+	fs.Int("chunk-rows", 0, "（已废弃，忽略）")
+	fs.Bool("gzip", true, "（已废弃，备份包始终为 .tar.gz）")
 	fs.Parse(args)
 
 	cfg.Workers = workers
@@ -93,23 +111,22 @@ func runBackupCLI(args []string) {
 	defer cancel()
 
 	start := time.Now()
-	dir, err := backup.Run(ctx, cfg, backup.Options{
+	pkg, err := backup.Run(ctx, cfg, backup.Options{
 		OutDir:        outDir,
 		Databases:     splitCSV(databases),
 		Tables:        splitCSV(tables),
 		Workers:       workers,
 		RowsPerInsert: rowsPerInsert,
-		ChunkRows:     chunkRows,
 		ShardMinRows:  shardMinRows,
 		ShardMax:      shardMax,
-		Gzip:          gzipOut,
+		CompressLevel: level,
 		Report:        consoleReporter,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "备份失败:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("✅ 备份完成: %s（耗时 %s）\n", dir, time.Since(start).Round(time.Second))
+	fmt.Printf("✅ 备份完成: %s（耗时 %s）\n", pkg, time.Since(start).Round(time.Second))
 }
 
 func runRestoreCLI(args []string) {
@@ -121,7 +138,8 @@ func runRestoreCLI(args []string) {
 	var create, recreate bool
 	var workers, commitBatch int
 
-	fs.StringVar(&dir, "dir", "", "备份目录（必填）")
+	fs.StringVar(&dir, "file", "", "备份包 .tar.gz（或旧版备份目录）")
+	fs.StringVar(&dir, "dir", "", "同 -file（兼容旧参数名）")
 	fs.StringVar(&databases, "databases", "", "只恢复指定的库（逗号分隔，按备份中的库名）")
 	fs.StringVar(&rename, "rename", "", "库改名映射 old:new，多个用逗号分隔")
 	fs.BoolVar(&create, "create", true, "目标库不存在时自动创建")
@@ -131,7 +149,7 @@ func runRestoreCLI(args []string) {
 	fs.Parse(args)
 
 	if dir == "" {
-		fmt.Fprintln(os.Stderr, "缺少 -dir 备份目录")
+		fmt.Fprintln(os.Stderr, "缺少 -file 备份包路径")
 		fs.Usage()
 		os.Exit(2)
 	}

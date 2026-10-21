@@ -1,4 +1,5 @@
 // Package restore 实现并行恢复：先恢复表结构，再多 worker 并行灌数据。
+// 输入可以是 .tar.gz 备份包（当前格式），也可以是旧版的备份目录。
 // 针对大数据量做了会话调优：关闭 foreign_key_checks/unique_checks/autocommit，
 // 批量事务提交，INSERT 语句逐行执行。
 package restore
@@ -25,7 +26,7 @@ import (
 
 // Options 恢复参数。
 type Options struct {
-	Dir       string            // 备份目录：可以是备份根目录，也可以是某个库的子目录
+	Dir       string            // .tar.gz 备份包；或旧版备份目录（根目录或某个库的子目录）
 	Databases []string          // 只恢复列出的库（按备份时的库名），为空恢复全部
 	Rename    map[string]string // 库改名映射 src:dst
 
@@ -35,7 +36,7 @@ type Options struct {
 	Workers     int // 并行 worker 数
 	CommitBatch int // 每个事务提交的语句条数
 
-	Report progress.Reporter
+	Report progress.Reporter `json:"-"`
 }
 
 func (o *Options) withDefaults() {
@@ -52,10 +53,10 @@ func (o *Options) withDefaults() {
 
 // dbDir 找到一个待恢复的库目录。
 type dbDir struct {
-	name     string // 备份中的原库名
-	target   string // 恢复到目标的库名
-	dir      string
-	meta     Meta
+	name      string // 备份中的原库名
+	target    string // 恢复到目标的库名
+	dir       string
+	meta      Meta
 	dataFiles []string
 }
 
@@ -70,6 +71,9 @@ type Meta struct {
 // Run 执行恢复。
 func Run(ctx context.Context, cfg dbconn.Config, o Options) error {
 	o.withDefaults()
+	if isArchive(o.Dir) {
+		return runArchive(ctx, cfg, o)
+	}
 
 	src, err := discover(o)
 	if err != nil {
@@ -166,9 +170,12 @@ func backupName(dir string) string {
 	return name
 }
 
-// ListBackedUpDatabases 列出备份目录中全部可恢复的数据库名（供 GUI 勾选列表使用）。
-// dir 可以是备份根目录，也可以是某个库的备份子目录。
+// ListBackedUpDatabases 列出备份中全部可恢复的数据库名（供 GUI 勾选列表使用）。
+// dir 可以是 .tar.gz 备份包（只读包头清单），也可以是旧版备份根目录或某个库的子目录。
 func ListBackedUpDatabases(dir string) ([]string, error) {
+	if isArchive(dir) {
+		return listArchiveDatabases(dir)
+	}
 	if isDBDir(dir) {
 		return []string{backupName(dir)}, nil
 	}
@@ -246,15 +253,19 @@ func discover(o Options) ([]dbDir, error) {
 	return out, nil
 }
 
-// applySchema 顺序执行 schema.sql 中的语句（按标记切分）。
+// applySchema 顺序执行 schema.sql 文件中的语句（旧版目录格式）。
 func applySchema(ctx context.Context, db *sql.DB, schemaPath string) error {
 	f, err := os.Open(schemaPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	return applySchemaReader(ctx, db, f)
+}
 
-	r := bufio.NewReaderSize(f, 1<<20)
+// applySchemaReader 顺序执行 schema.sql 内容中的语句（按标记切分）。
+func applySchemaReader(ctx context.Context, ex execer, in io.Reader) error {
+	r := bufio.NewReaderSize(in, 1<<20)
 	var b strings.Builder
 	inStmt := false
 
@@ -269,7 +280,7 @@ func applySchema(ctx context.Context, db *sql.DB, schemaPath string) error {
 			inStmt = false
 			stmt := strings.TrimSpace(b.String())
 			if stmt != "" {
-				if _, err := db.ExecContext(ctx, stmt); err != nil {
+				if _, err := ex.ExecContext(ctx, stmt); err != nil {
 					snip := stmt
 					if len(snip) > 200 {
 						snip = snip[:200] + "..."

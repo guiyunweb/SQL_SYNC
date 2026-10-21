@@ -24,18 +24,6 @@ var hexTypes = map[string]bool{
 	"GEOMETRYCOLLECTION": true,
 }
 
-var stringEscaper = strings.NewReplacer(
-	"\x00", `\0`,
-	"'", `\'`,
-	`"`, `\"`,
-	"\b", `\b`,
-	"\n", `\n`,
-	"\r", `\r`,
-	"\t", `\t`,
-	"\x1a", `\Z`,
-	`\`, `\\`,
-)
-
 // QuoteIdent 给标识符加反引号。
 func QuoteIdent(s string) string {
 	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
@@ -59,35 +47,55 @@ func ColumnKind(dbTypeName string) string {
 	return "str"
 }
 
-// AppendValue 把单个 RawBytes 值按列类型追加到 buf。
-// raw 为 nil 表示 SQL NULL。
-func AppendValue(buf *strings.Builder, raw []byte, kind string) {
+// escapeTable 标记需要反斜杠转义的字节及其转义字符（0 表示原样输出）。
+var escapeTable = func() (t [256]byte) {
+	t[0] = '0'
+	t['\''] = '\''
+	t['"'] = '"'
+	t['\b'] = 'b'
+	t['\n'] = 'n'
+	t['\r'] = 'r'
+	t['\t'] = 't'
+	t[0x1a] = 'Z'
+	t['\\'] = '\\'
+	return
+}()
+
+const hexDigits = "0123456789abcdef"
+
+// AppendValue 把单个 RawBytes 值按列类型追加到 dst 并返回新切片。
+// raw 为 nil 表示 SQL NULL。逐字节转义、零分配，是备份的热点路径。
+func AppendValue(dst, raw []byte, kind string) []byte {
 	if raw == nil {
-		buf.WriteString("NULL")
-		return
+		return append(dst, "NULL"...)
 	}
 	switch kind {
 	case "num":
 		if len(raw) == 0 {
-			buf.WriteString("NULL")
-			return
+			return append(dst, "NULL"...)
 		}
-		buf.Write(raw)
+		return append(dst, raw...)
 	case "hex":
 		if len(raw) == 0 {
-			buf.WriteString("''")
-			return
+			return append(dst, "''"...)
 		}
-		buf.WriteString("0x")
-		const digits = "0123456789abcdef"
+		dst = append(dst, '0', 'x')
 		for _, b := range raw {
-			buf.WriteByte(digits[b>>4])
-			buf.WriteByte(digits[b&0x0f])
+			dst = append(dst, hexDigits[b>>4], hexDigits[b&0x0f])
 		}
+		return dst
 	default:
-		buf.WriteByte('\'')
-		stringEscaper.WriteString(buf, string(raw))
-		buf.WriteByte('\'')
+		dst = append(dst, '\'')
+		start := 0
+		for i, b := range raw {
+			if e := escapeTable[b]; e != 0 {
+				dst = append(dst, raw[start:i]...)
+				dst = append(dst, '\\', e)
+				start = i + 1
+			}
+		}
+		dst = append(dst, raw[start:]...)
+		return append(dst, '\'')
 	}
 }
 
@@ -139,16 +147,16 @@ func (s *RowScanner) ColumnsClause() string {
 	return b.String()
 }
 
-// AppendRow 把一行渲染成 "(v1,v2,...)" 追加到 buf。
-func (s *RowScanner) AppendRow(buf *strings.Builder, raws []sql.RawBytes) {
-	buf.WriteByte('(')
+// AppendRow 把一行渲染成 "(v1,v2,...)" 追加到 dst 并返回新切片。
+func (s *RowScanner) AppendRow(dst []byte, raws []sql.RawBytes) []byte {
+	dst = append(dst, '(')
 	for i, raw := range raws {
 		if i > 0 {
-			buf.WriteByte(',')
+			dst = append(dst, ',')
 		}
-		AppendValue(buf, raw, s.Kinds[i])
+		dst = AppendValue(dst, raw, s.Kinds[i])
 	}
-	buf.WriteByte(')')
+	return append(dst, ')')
 }
 
 // SplitStatements 按自定义标记切分 schema.sql：

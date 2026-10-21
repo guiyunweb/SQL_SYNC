@@ -1,50 +1,56 @@
 // Package backup 实现 MySQL 逻辑备份：表结构与数据分离导出，
-// 多表并行、大表按数值主键范围分片、键集分页读取、可选 gzip 压缩。
+// 多表并行、大表按数值主键范围分片、单查询流式读取，
+// 全部内容并行压缩后写入单个 .tar.gz 备份包。
 package backup
 
 import (
-	"compress/gzip"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/klauspost/compress/gzip"
 
 	"sqlsync/internal/dbconn"
 	"sqlsync/internal/progress"
 	"sqlsync/internal/sqlfmt"
 )
 
+// ManifestName 备份包内第一个条目，记录包含哪些库，恢复端只读它就能列出库清单。
+const ManifestName = "sqlsync.json"
+
 // Options 备份参数。
 type Options struct {
-	OutDir    string   // 输出根目录，库名作为一级子目录
+	OutDir    string   // 备份包输出目录
 	Databases []string // 为空表示全部非系统库
 	Tables    []string // 仅备份这些表，为空不限
 
 	Workers       int   // 并行 worker 数
 	RowsPerInsert int   // 每条 INSERT 最多行数
 	MaxStmtBytes  int   // 每条 INSERT 最大字节
-	ChunkRows     int   // 每次 SELECT 拉取的行数
-	ShardMinRows  int64 // 表行数超过该值且含数值单列主键时才分片
+	ChunkBytes    int   // 包内单个数据条目的目标大小（恢复端按条目并行）
+	ShardMinRows  int64 // 每个分片的目标行数；表行数达到其 2 倍且含数值单列主键时分片
 	ShardMax      int   // 单表最大分片数
-	Gzip          bool  // 输出是否 gzip 压缩
+	CompressLevel int   // gzip 级别 1-9，默认 1（最快）
 
-	Report progress.Reporter
+	Report progress.Reporter `json:"-"`
 }
 
 // warn 上报一条告警日志。
 func (o *Options) warn(msg string) {
-	if o.Report != nil {
-		o.Report(progress.Event{Kind: progress.KindLog, When: time.Now(), Message: "⚠ " + msg})
-	}
+	o.log("⚠ " + msg)
+}
+
+func (o *Options) log(msg string) {
+	o.Report(progress.Event{Kind: progress.KindLog, When: time.Now(), Message: msg})
 }
 
 func (o *Options) withDefaults() {
@@ -55,16 +61,19 @@ func (o *Options) withDefaults() {
 		o.RowsPerInsert = 500
 	}
 	if o.MaxStmtBytes <= 0 {
-		o.MaxStmtBytes = 8 << 20
+		o.MaxStmtBytes = 2 << 20 // 兼容 max_allowed_packet=4MB 的老服务器
 	}
-	if o.ChunkRows <= 0 {
-		o.ChunkRows = 2000
+	if o.ChunkBytes <= 0 {
+		o.ChunkBytes = 8 << 20
 	}
 	if o.ShardMinRows <= 0 {
-		o.ShardMinRows = 2_000_000
+		o.ShardMinRows = 500_000
 	}
 	if o.ShardMax <= 0 {
-		o.ShardMax = 8
+		o.ShardMax = 16
+	}
+	if o.CompressLevel < gzip.BestSpeed || o.CompressLevel > gzip.BestCompression {
+		o.CompressLevel = gzip.BestSpeed
 	}
 	if o.Report == nil {
 		o.Report = progress.Nop
@@ -78,7 +87,7 @@ type tableInfo struct {
 	Rows      int64
 	Engine    string
 	PKCol     string // 数值型单列主键（用于分片），可为空
-	OrderCols string // 用于分块稳定排序的列（已带引号、逗号连接），可为空
+	OrderCols string // 主键/唯一键列（已带引号、逗号连接），可为空
 }
 
 // shardTask 一个导出任务：整表或某个主键区间。
@@ -88,9 +97,27 @@ type shardTask struct {
 	Shards   int
 	Min, Max int64 // 区间 [min, max)，整表导出时无意义
 	HasRange bool
+	EstRows  int64 // 本任务预估行数，用于调度与进度
 }
 
-// Meta 写入 meta.json 的备份元数据。
+// Manifest 写在备份包最前面的清单。
+type Manifest struct {
+	Format    int          `json:"format"`
+	CreatedAt time.Time    `json:"created_at"`
+	Server    string       `json:"server"`
+	Databases []ManifestDB `json:"databases"`
+}
+
+// ManifestDB 清单中的一个库。
+type ManifestDB struct {
+	Name      string `json:"name"`
+	Charset   string `json:"charset"`
+	Collation string `json:"collation"`
+	Tables    int    `json:"tables"`
+	EstRows   int64  `json:"est_rows"`
+}
+
+// Meta 写入 <库>/meta.json 的备份元数据（位于包末尾，记录实际行数）。
 type Meta struct {
 	Database    string           `json:"database"`
 	Charset     string           `json:"charset"`
@@ -101,18 +128,41 @@ type Meta struct {
 	Tables      []string         `json:"tables"`
 	TableRows   map[string]int64 `json:"table_rows"`
 	TotalRows   int64            `json:"total_rows"`
-	DataBytes   int64            `json:"data_bytes"`
 }
 
-// Run 执行备份，返回输出目录。
+// dbPlan 一个库的备份计划。
+type dbPlan struct {
+	meta   Meta
+	tables []tableInfo
+}
+
+// counters 跨 worker 共享的进度计数。
+type counters struct {
+	rows      atomic.Int64
+	totalRows int64
+	mu        sync.Mutex
+	tableRows map[string]int64 // "库/表" -> 实际导出行数
+}
+
+func (c *counters) addTableRows(db, table string, n int64) {
+	c.mu.Lock()
+	c.tableRows[db+"/"+table] += n
+	c.mu.Unlock()
+}
+
+// Run 执行备份，返回生成的 .tar.gz 路径。
 func Run(ctx context.Context, cfg dbconn.Config, o Options) (string, error) {
 	o.withDefaults()
 	if o.OutDir == "" {
 		return "", fmt.Errorf("输出目录不能为空")
 	}
+	started := time.Now()
 
 	connNoDB := cfg
 	connNoDB.Database = ""
+	if connNoDB.Workers < o.Workers {
+		connNoDB.Workers = o.Workers
+	}
 	db, err := dbconn.Open(connNoDB)
 	if err != nil {
 		return "", err
@@ -129,23 +179,180 @@ func Run(ctx context.Context, cfg dbconn.Config, o Options) (string, error) {
 	if len(dbs) == 0 {
 		return "", fmt.Errorf("没有可备份的数据库")
 	}
-	o.Report(progress.Event{Kind: progress.KindLog, When: time.Now(),
-		Message: fmt.Sprintf("待备份数据库: %s", strings.Join(dbs, ", "))})
+	o.log(fmt.Sprintf("待备份数据库: %s", strings.Join(dbs, ", ")))
+
+	var server string
+	_ = db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&server)
+
+	// 1. 先规划全部库：字符集、表清单、预估行数（用于总体进度）
+	cnt := &counters{tableRows: map[string]int64{}}
+	plans := make([]*dbPlan, 0, len(dbs))
+	man := Manifest{Format: 1, CreatedAt: started, Server: server}
+	for _, name := range dbs {
+		p := &dbPlan{meta: Meta{Database: name, StartedAt: started, MySQLServer: server, TableRows: map[string]int64{}}}
+		_ = db.QueryRowContext(ctx,
+			"SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+			name).Scan(&p.meta.Charset, &p.meta.Collation)
+		p.tables, err = listTables(ctx, db, name, o.Tables)
+		if err != nil {
+			return "", fmt.Errorf("读取库 %s 的表清单失败: %w", name, err)
+		}
+		var est int64
+		for _, t := range p.tables {
+			if !strings.EqualFold(t.Engine, "VIEW") {
+				est += t.Rows
+			}
+		}
+		cnt.totalRows += est
+		man.Databases = append(man.Databases, ManifestDB{Name: name, Charset: p.meta.Charset,
+			Collation: p.meta.Collation, Tables: len(p.tables), EstRows: est})
+		plans = append(plans, p)
+	}
 
 	abs, err := filepath.Abs(o.OutDir)
 	if err != nil {
 		return "", err
 	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return "", err
+	}
+	label := "multi"
+	if len(dbs) == 1 {
+		label = safeFileName(dbs[0])
+	}
+	outPath := filepath.Join(abs, fmt.Sprintf("sqlsync_%s_%s.tar.gz", label, started.Format("20060102_150405")))
 
-	for _, name := range dbs {
-		if err := ctx.Err(); err != nil {
-			return abs, err
+	aw, err := newArchiveWriter(outPath, o.CompressLevel)
+	if err != nil {
+		return "", err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			aw.abort()
 		}
-		if err := backupDatabase(ctx, db, name, abs, o); err != nil {
-			return abs, fmt.Errorf("备份库 %s 失败: %w", name, err)
+	}()
+	o.log("备份包: " + outPath)
+
+	raw, _ := json.MarshalIndent(man, "", "  ")
+	if err := aw.addFile(ManifestName, raw); err != nil {
+		return "", err
+	}
+
+	// 2. 各库表结构先入包（恢复端读到某库数据前一定已建好表）
+	var tasks []shardTask
+	for _, p := range plans {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		name := p.meta.Database
+		o.log(fmt.Sprintf("库 %s: 共 %d 张表（含视图），导出表结构…", name, len(p.tables)))
+		var buf bytes.Buffer
+		if err := dumpSchema(ctx, db, name, &buf, p.tables, o); err != nil {
+			return "", fmt.Errorf("库 %s 导出表结构失败: %w", name, err)
+		}
+		if err := aw.addFile(name+"/schema.sql", buf.Bytes()); err != nil {
+			return "", err
+		}
+		for _, t := range p.tables {
+			if strings.EqualFold(t.Engine, "VIEW") {
+				continue // 视图只有结构，没有数据
+			}
+			p.meta.Tables = append(p.meta.Tables, t.Name)
+			tasks = append(tasks, planShards(ctx, db, t, o)...)
 		}
 	}
-	return abs, nil
+
+	// 3. 全部库的数据任务放进同一个 worker 池，大任务优先，减少尾部只剩一个大表在跑的情况
+	sort.SliceStable(tasks, func(i, j int) bool { return tasks[i].EstRows > tasks[j].EstRows })
+	o.log(fmt.Sprintf("数据导出任务 %d 个，预估 %s 行，%d 个 worker 并行",
+		len(tasks), progress.Count(cnt.totalRows), o.Workers))
+
+	stopOverall := reportOverall(o, cnt, aw, started)
+	err = runTasks(ctx, db, aw, tasks, o, cnt)
+	stopOverall()
+	if err != nil {
+		return "", err
+	}
+
+	// 4. 各库 meta.json（记录实际行数）放在包末尾
+	var total int64
+	for _, p := range plans {
+		for _, t := range p.meta.Tables {
+			n := cnt.tableRows[p.meta.Database+"/"+t]
+			p.meta.TableRows[t] = n
+			p.meta.TotalRows += n
+		}
+		total += p.meta.TotalRows
+		p.meta.FinishedAt = time.Now()
+		raw, _ := json.MarshalIndent(p.meta, "", "  ")
+		if err := aw.addFile(p.meta.Database+"/meta.json", raw); err != nil {
+			return "", err
+		}
+	}
+	if err := aw.finish(); err != nil {
+		return "", err
+	}
+	ok = true
+
+	elapsed := time.Since(started)
+	o.Report(progress.Event{Kind: progress.KindOverall, When: time.Now(), Done: 1, Total: 1,
+		Message: fmt.Sprintf("已导出 %s 行", progress.Count(total))})
+	o.Report(progress.Event{Kind: progress.KindSummary, When: time.Now(),
+		Message: fmt.Sprintf("备份完成: %d 个库, %s 行, 备份包 %s, 平均 %s 行/s",
+			len(plans), progress.Count(total), progress.Bytes(aw.size()),
+			progress.Count(int64(float64(total)/max(elapsed.Seconds(), 1))))})
+	return outPath, nil
+}
+
+// reportOverall 每 500ms 上报一次总体进度（行数、速度、包大小），返回停止函数。
+func reportOverall(o Options, cnt *counters, aw *archiveWriter, started time.Time) func() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tk := time.NewTicker(500 * time.Millisecond)
+		defer tk.Stop()
+		lastRows, lastAt := int64(0), started
+		var rate float64
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-tk.C:
+				rows := cnt.rows.Load()
+				if dt := now.Sub(lastAt).Seconds(); dt >= 2 {
+					inst := float64(rows-lastRows) / dt
+					if rate == 0 {
+						rate = inst
+					} else {
+						rate = rate*0.6 + inst*0.4 // 平滑，避免数字乱跳
+					}
+					lastRows, lastAt = rows, now
+				}
+				msg := fmt.Sprintf("已导出 %s / 约 %s 行 · 已写入 %s",
+					progress.Count(rows), progress.Count(cnt.totalRows), progress.Bytes(aw.size()))
+				if rate > 0 {
+					msg += fmt.Sprintf(" · %s 行/s", progress.Count(int64(rate)))
+				}
+				o.Report(progress.Event{Kind: progress.KindOverall, When: now,
+					Done: rows, Total: cnt.totalRows, Message: msg})
+			}
+		}
+	}()
+	return func() { close(done); wg.Wait() }
+}
+
+// safeFileName 把库名中不适合做文件名的字符替换掉。
+func safeFileName(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|', ' ':
+			return '_'
+		}
+		return r
+	}, s)
 }
 
 var systemSchemas = map[string]bool{
@@ -169,79 +376,6 @@ func listUserDatabases(ctx context.Context, db *sql.DB) ([]string, error) {
 		}
 	}
 	return out, rows.Err()
-}
-
-func backupDatabase(ctx context.Context, db *sql.DB, name, outRoot string, o Options) error {
-	dir := filepath.Join(outRoot, name)
-	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o755); err != nil {
-		return err
-	}
-
-	var charset, collation string
-	_ = db.QueryRowContext(ctx,
-		"SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
-		name).Scan(&charset, &collation)
-
-	meta := Meta{
-		Database: name, Charset: charset, Collation: collation,
-		StartedAt: time.Now(), TableRows: map[string]int64{},
-	}
-	_ = db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&meta.MySQLServer)
-
-	tables, err := listTables(ctx, db, name, o.Tables)
-	if err != nil {
-		return err
-	}
-	o.Report(progress.Event{Kind: progress.KindLog, When: time.Now(),
-		Message: fmt.Sprintf("库 %s: 共 %d 张表（含视图）", name, len(tables))})
-
-	// 1. 表结构（含视图/触发器/存储过程/事件）先落盘
-	if err := dumpSchema(ctx, db, name, dir, tables, o); err != nil {
-		return fmt.Errorf("导出表结构失败: %w", err)
-	}
-	o.Report(progress.Event{Kind: progress.KindLog, When: time.Now(),
-		Message: fmt.Sprintf("库 %s: 表结构已写入 schema.sql", name)})
-
-	// 2. 规划数据导出任务
-	var tasks []shardTask
-	for _, t := range tables {
-		if strings.EqualFold(t.Engine, "VIEW") {
-			continue // 视图只有结构，没有数据
-		}
-		meta.Tables = append(meta.Tables, t.Name)
-		meta.TableRows[t.Name] = t.Rows
-		meta.TotalRows += t.Rows
-		tasks = append(tasks, planShards(ctx, db, t, o)...)
-	}
-	sort.Slice(tasks, func(i, j int) bool {
-		if tasks[i].tbl.Name == tasks[j].tbl.Name {
-			return tasks[i].Shard < tasks[j].Shard
-		}
-		return tasks[i].tbl.Name < tasks[j].tbl.Name
-	})
-	o.Report(progress.Event{Kind: progress.KindLog, When: time.Now(),
-		Message: fmt.Sprintf("库 %s: 数据导出任务 %d 个，%d 个 worker 并行",
-			name, len(tasks), o.Workers)})
-
-	// 3. 并发导出数据
-	var bytesWritten int64
-	if len(tasks) > 0 {
-		bytesWritten, err = runTasks(ctx, db, dir, tasks, o)
-		if err != nil {
-			return err
-		}
-	}
-	meta.DataBytes = bytesWritten
-	meta.FinishedAt = time.Now()
-
-	raw, _ := json.MarshalIndent(meta, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "meta.json"), raw, 0o644); err != nil {
-		return err
-	}
-	o.Report(progress.Event{Kind: progress.KindSummary, When: time.Now(), Task: name,
-		Message: fmt.Sprintf("库 %s 完成: %d 张表, 约 %d 行, 数据文件 %.1f MB",
-			name, len(meta.Tables), meta.TotalRows, float64(bytesWritten)/float64(1<<20))})
-	return nil
 }
 
 func listTables(ctx context.Context, db *sql.DB, schema string, only []string) ([]tableInfo, error) {
@@ -283,8 +417,9 @@ func planShards(ctx context.Context, db *sql.DB, t tableInfo, o Options) []shard
 	pk, orderCols := keyColumns(ctx, db, t)
 	t.OrderCols = orderCols
 
-	if pk == "" || t.Rows < o.ShardMinRows {
-		return []shardTask{{tbl: t}}
+	whole := []shardTask{{tbl: t, EstRows: t.Rows}}
+	if pk == "" || t.Rows < 2*o.ShardMinRows {
+		return whole
 	}
 
 	var min, maxV sql.NullInt64
@@ -292,19 +427,16 @@ func planShards(ctx context.Context, db *sql.DB, t tableInfo, o Options) []shard
 		sqlfmt.QuoteIdent(pk), sqlfmt.QuoteIdent(pk),
 		sqlfmt.QuoteIdent(t.Database), sqlfmt.QuoteIdent(t.Name))
 	if err := db.QueryRowContext(ctx, q).Scan(&min, &maxV); err != nil || !min.Valid || !maxV.Valid {
-		return []shardTask{{tbl: t}}
+		return whole
 	}
 
 	shards := int(t.Rows / o.ShardMinRows)
-	if shards < 2 {
-		return []shardTask{{tbl: t}}
-	}
 	if shards > o.ShardMax {
 		shards = o.ShardMax
 	}
 	span := maxV.Int64 - min.Int64 + 1
-	if span < int64(shards) {
-		return []shardTask{{tbl: t}}
+	if shards < 2 || span < int64(shards) {
+		return whole
 	}
 
 	t.PKCol = pk
@@ -315,7 +447,8 @@ func planShards(ctx context.Context, db *sql.DB, t tableInfo, o Options) []shard
 		if i == shards-1 {
 			hi = maxV.Int64 + 1 // 最后一段带上右边界
 		}
-		tasks = append(tasks, shardTask{tbl: t, Shard: i + 1, Shards: shards, Min: lo, Max: hi, HasRange: true})
+		tasks = append(tasks, shardTask{tbl: t, Shard: i + 1, Shards: shards, Min: lo, Max: hi,
+			HasRange: true, EstRows: t.Rows / int64(shards)})
 	}
 	return tasks
 }
@@ -391,16 +524,17 @@ func keyColumns(ctx context.Context, db *sql.DB, t tableInfo) (pk, orderCols str
 	return pk, strings.Join(order, ",")
 }
 
-// runTasks 并发执行导出任务，返回数据文件总字节数。
-func runTasks(ctx context.Context, db *sql.DB, dbDir string, tasks []shardTask, o Options) (int64, error) {
+// runTasks 并发执行导出任务。
+func runTasks(ctx context.Context, db *sql.DB, aw *archiveWriter, tasks []shardTask, o Options, cnt *counters) error {
+	if len(tasks) == 0 {
+		return nil
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	taskCh := make(chan shardTask)
 	var mu sync.Mutex
-	var totalBytes int64
 	var firstErr error
-
 	fail := func(err error) {
 		mu.Lock()
 		if firstErr == nil {
@@ -410,8 +544,9 @@ func runTasks(ctx context.Context, db *sql.DB, dbDir string, tasks []shardTask, 
 		mu.Unlock()
 	}
 
+	workers := min(o.Workers, len(tasks))
 	var wg sync.WaitGroup
-	for i := 0; i < o.Workers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -421,13 +556,19 @@ func runTasks(ctx context.Context, db *sql.DB, dbDir string, tasks []shardTask, 
 				return
 			}
 			defer conn.Close()
+			// 流式读取期间客户端还要压缩，放宽服务端写超时，避免大表中途断开
+			for _, q := range []string{
+				"SET SESSION net_write_timeout = 3600",
+				"SET SESSION net_read_timeout = 3600",
+			} {
+				_, _ = conn.ExecContext(ctx, q)
+			}
+			var buf []byte // worker 内复用的条目缓冲
 			for task := range taskCh {
-				n, err := dumpShard(ctx, conn, dbDir, task, o)
-				mu.Lock()
-				totalBytes += n
-				mu.Unlock()
-				if err != nil {
-					fail(fmt.Errorf("表 %s 分片 %d 导出失败: %w", task.tbl.Name, task.Shard, err))
+				if buf, err = dumpShard(ctx, conn, aw, task, o, cnt, buf); err != nil {
+					if ctx.Err() == nil {
+						fail(fmt.Errorf("表 %s.%s 分片 %d 导出失败: %w", task.tbl.Database, task.tbl.Name, task.Shard, err))
+					}
 					return
 				}
 			}
@@ -444,209 +585,121 @@ dispatch:
 	}
 	close(taskCh)
 	wg.Wait()
-	return totalBytes, firstErr
+	if firstErr == nil {
+		firstErr = ctx.Err()
+	}
+	return firstErr
 }
 
-// dumpShard 将一个表（或其主键区间）的数据写入 data/<table>[#n].sql[.gz]。
-func dumpShard(ctx context.Context, conn *sql.Conn, dbDir string, task shardTask, o Options) (int64, error) {
+// dumpShard 用一条流式 SELECT 读出一个表（或其主键区间），
+// 渲染成多值 INSERT，按 ChunkBytes 切成若干条目写入备份包：
+//
+//	<库>/data/<表>/<分片>-<序号>.sql
+//
+// 返回（可能扩容后的）缓冲区供下个任务复用。
+func dumpShard(ctx context.Context, conn *sql.Conn, aw *archiveWriter, task shardTask,
+	o Options, cnt *counters, buf []byte) ([]byte, error) {
+
 	t := task.tbl
 	label := t.Name
-	fname := t.Name + ".sql"
 	if task.HasRange {
-		fname = fmt.Sprintf("%s#%03d.sql", t.Name, task.Shard)
 		label = fmt.Sprintf("%s#%d/%d", t.Name, task.Shard, task.Shards)
 	}
-	if o.Gzip {
-		fname += ".gz"
-	}
-	path := filepath.Join(dbDir, "data", fname)
-
 	report := func(k progress.Kind, msg string, done int64) {
 		o.Report(progress.Event{Kind: k, When: time.Now(), Task: t.Database + "/" + label,
-			Message: msg, Done: done, Total: t.Rows})
+			Message: msg, Done: done, Total: task.EstRows})
 	}
 	report(progress.KindTaskStart, "开始导出", 0)
 
-	f, err := os.Create(path)
+	q := fmt.Sprintf("SELECT * FROM %s.%s", sqlfmt.QuoteIdent(t.Database), sqlfmt.QuoteIdent(t.Name))
+	var args []any
+	if task.HasRange {
+		q += fmt.Sprintf(" WHERE %s >= ? AND %s < ?", sqlfmt.QuoteIdent(t.PKCol), sqlfmt.QuoteIdent(t.PKCol))
+		args = []any{task.Min, task.Max}
+	}
+	rows, err := conn.QueryContext(ctx, q, args...)
 	if err != nil {
-		return 0, err
+		return buf, err
 	}
-	defer f.Close()
-
-	var w io.Writer = f
-	var gz *gzip.Writer
-	if o.Gzip {
-		gz = gzip.NewWriter(f)
-		w = gz
+	defer rows.Close()
+	cts, err := rows.ColumnTypes()
+	if err != nil {
+		return buf, err
 	}
+	scanner := sqlfmt.NewRowScanner(cts)
+	insertPrefix := "INSERT INTO " + sqlfmt.QuoteIdent(t.Name) + " " + scanner.ColumnsClause() + " VALUES "
 
-	header := fmt.Sprintf("-- 数据文件  库: %s  表: %s  分片: %d/%d  时间: %s\n",
-		t.Database, t.Name, task.Shard, task.Shards, time.Now().Format("2006-01-02 15:04:05"))
-
-	var rowsWritten int64
-	var stmt strings.Builder
-	stmt.Grow(o.MaxStmtBytes + 1<<16)
-	stmtRows := 0
-	var scanner *sqlfmt.RowScanner
-	pkIdx := -1
-
-	flush := func() error {
-		if stmtRows == 0 {
+	if need := o.ChunkBytes + o.MaxStmtBytes + 1<<16; cap(buf) < need {
+		buf = make([]byte, 0, need)
+	}
+	buf = buf[:0]
+	seq := 0
+	flushChunk := func() error {
+		if len(buf) == 0 {
 			return nil
 		}
-		stmt.WriteString(";\n")
-		if _, err := w.Write([]byte(stmt.String())); err != nil {
-			return err
-		}
-		stmt.Reset()
-		stmt.Grow(o.MaxStmtBytes + 1<<16)
-		stmtRows = 0
-		return nil
+		seq++
+		name := fmt.Sprintf("%s/data/%s/%03d-%05d.sql", t.Database, t.Name, task.Shard, seq)
+		err := aw.addFile(name, buf)
+		buf = buf[:0]
+		return err
 	}
 
-	if _, err := w.Write([]byte(header)); err != nil {
-		return 0, err
-	}
-
-	if !task.HasRange && t.PKCol != "" {
-		// 整表导出：有数值主键的表也走键集分页（比 OFFSET 快得多）
-		task.HasRange = true
-		task.Min = math.MinInt64
-		task.Max = math.MaxInt64
-		task.Shard = 0
-	}
-
-	offset := int64(0)
-	lastPK := task.Min
-	firstPage := true
-	useKeyset := task.HasRange && t.PKCol != ""
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		var q string
-		var args []interface{}
-		switch {
-		case useKeyset && firstPage:
-			// 键集分页第一页：pk >= Min；后续页改用 pk > lastPK 推进
-			q = fmt.Sprintf("SELECT * FROM %s.%s WHERE %s >= ? AND %s < ? ORDER BY %s LIMIT ?",
-				sqlfmt.QuoteIdent(t.Database), sqlfmt.QuoteIdent(t.Name),
-				sqlfmt.QuoteIdent(t.PKCol), sqlfmt.QuoteIdent(t.PKCol), sqlfmt.QuoteIdent(t.PKCol))
-			args = []interface{}{lastPK, task.Max, o.ChunkRows}
-		case useKeyset:
-			q = fmt.Sprintf("SELECT * FROM %s.%s WHERE %s > ? AND %s < ? ORDER BY %s LIMIT ?",
-				sqlfmt.QuoteIdent(t.Database), sqlfmt.QuoteIdent(t.Name),
-				sqlfmt.QuoteIdent(t.PKCol), sqlfmt.QuoteIdent(t.PKCol), sqlfmt.QuoteIdent(t.PKCol))
-			args = []interface{}{lastPK, task.Max, o.ChunkRows}
-		case t.OrderCols != "":
-			q = fmt.Sprintf("SELECT * FROM %s.%s ORDER BY %s LIMIT ? OFFSET ?",
-				sqlfmt.QuoteIdent(t.Database), sqlfmt.QuoteIdent(t.Name), t.OrderCols)
-			args = []interface{}{o.ChunkRows, offset}
-		default:
-			q = fmt.Sprintf("SELECT * FROM %s.%s LIMIT ? OFFSET ?",
-				sqlfmt.QuoteIdent(t.Database), sqlfmt.QuoteIdent(t.Name))
-			args = []interface{}{o.ChunkRows, offset}
-		}
-
-		rows, err := conn.QueryContext(ctx, q, args...)
+	var rowsWritten, reported int64
+	stmtRows, stmtStart := 0, 0
+	lastReport := time.Now()
+	for rows.Next() {
+		raws, err := scanner.Scan(rows)
 		if err != nil {
-			return 0, err
+			return buf, err
 		}
-		if scanner == nil {
-			cts, err := rows.ColumnTypes()
-			if err != nil {
-				rows.Close()
-				return 0, err
-			}
-			scanner = sqlfmt.NewRowScanner(cts)
-			if useKeyset {
-				for i, c := range scanner.Cols {
-					if strings.EqualFold(c, t.PKCol) {
-						pkIdx = i
-						break
-					}
-				}
-				if pkIdx < 0 {
-					useKeyset = false // 主键不在结果列里（理论上不会），退回 OFFSET
-				}
-			}
+		if stmtRows == 0 {
+			stmtStart = len(buf)
+			buf = append(buf, insertPrefix...)
+		} else {
+			buf = append(buf, ',')
 		}
+		buf = scanner.AppendRow(buf, raws)
+		stmtRows++
+		rowsWritten++
 
-		n := 0
-		for rows.Next() {
-			raws, err := scanner.Scan(rows)
-			if err != nil {
-				rows.Close()
-				return 0, err
-			}
-			if stmtRows == 0 {
-				stmt.WriteString("INSERT INTO ")
-				stmt.WriteString(sqlfmt.QuoteIdent(t.Name))
-				stmt.WriteByte(' ')
-				stmt.WriteString(scanner.ColumnsClause())
-				stmt.WriteString(" VALUES ")
-			} else {
-				stmt.WriteByte(',')
-			}
-			scanner.AppendRow(&stmt, raws)
-			stmtRows++
-			rowsWritten++
-			n++
-
-			// 数值可能以字符串形式返回，解析失败则退回 OFFSET
-			if useKeyset {
-				if v, err := strconv.ParseInt(string(raws[pkIdx]), 10, 64); err == nil {
-					lastPK = v
-				} else {
-					useKeyset = false
-				}
-			}
-
-			if stmtRows >= o.RowsPerInsert || stmt.Len() >= o.MaxStmtBytes {
-				if err := flush(); err != nil {
-					rows.Close()
-					return 0, err
+		if stmtRows >= o.RowsPerInsert || len(buf)-stmtStart >= o.MaxStmtBytes {
+			buf = append(buf, ";\n"...)
+			stmtRows = 0
+			if len(buf) >= o.ChunkBytes {
+				if err := flushChunk(); err != nil {
+					return buf, err
 				}
 			}
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return 0, err
-		}
-		offset += int64(n)
-		firstPage = false
-		report(progress.KindTaskUpdate, "导出中", rowsWritten)
-		if n < o.ChunkRows {
-			break
+		if rowsWritten&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return buf, err
+			}
+			if time.Since(lastReport) >= 300*time.Millisecond {
+				cnt.rows.Add(rowsWritten - reported)
+				reported = rowsWritten
+				lastReport = time.Now()
+				report(progress.KindTaskUpdate, "导出中", rowsWritten)
+			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return buf, err
+	}
+	if stmtRows > 0 {
+		buf = append(buf, ";\n"...)
+	}
+	if err := flushChunk(); err != nil {
+		return buf, err
+	}
+	cnt.rows.Add(rowsWritten - reported)
+	cnt.addTableRows(t.Database, t.Name, rowsWritten)
 
-	if err := flush(); err != nil {
-		return 0, err
-	}
-	if gz != nil {
-		if err := gz.Close(); err != nil {
-			return 0, err
-		}
-	}
-	if err := f.Sync(); err != nil {
-		return 0, err
-	}
-
-	// 空分片直接删掉，恢复端少一个文件
 	if rowsWritten == 0 {
-		os.Remove(path)
-		report(progress.KindTaskDone, "空分片", 0)
-		return 0, nil
+		report(progress.KindTaskDone, "空表/空分片", 0)
+	} else {
+		report(progress.KindTaskDone, fmt.Sprintf("完成，%s 行", progress.Count(rowsWritten)), rowsWritten)
 	}
-
-	st, _ := os.Stat(path)
-	var size int64
-	if st != nil {
-		size = st.Size()
-	}
-	report(progress.KindTaskDone,
-		fmt.Sprintf("完成，%d 行，%.1f MB", rowsWritten, float64(size)/float64(1<<20)), rowsWritten)
-	return size, nil
+	return buf, nil
 }
